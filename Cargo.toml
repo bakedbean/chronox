@@ -5,6 +5,7 @@ edition = "2024"
 description = "A standalone ratatui TUI over the sessionx change timeline."
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 ratatui = "0.29"
 sessionx = { git = "https://github.com/bakedbean/sessionx", rev = "3f83a3abbfe9e5a00521f9d91c7c08c815a9d151" }
 
