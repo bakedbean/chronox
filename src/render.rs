@@ -323,12 +323,14 @@ fn abbreviate_path(rel: &str, max: usize) -> String {
 }
 
 pub fn hhmm(timestamp_ms: i64) -> String {
-    // Wall-clock HH:MM (UTC) derived from epoch ms without pulling in chrono —
-    // a relative glance, not a precise local timestamp.
-    let secs = timestamp_ms.div_euclid(1000);
-    let h = secs.div_euclid(3600).rem_euclid(24);
-    let m = secs.div_euclid(60).rem_euclid(60);
-    format!("{h:02}:{m:02}")
+    // Wall-clock HH:MM in the machine's local timezone (DST-aware), derived from
+    // epoch ms. `--:--` only if the timestamp falls outside chrono's range.
+    use chrono::{Local, TimeZone};
+    Local
+        .timestamp_millis_opt(timestamp_ms)
+        .single()
+        .map(|dt| dt.format("%H:%M").to_string())
+        .unwrap_or_else(|| "--:--".to_string())
 }
 
 #[cfg(test)]
@@ -401,6 +403,27 @@ mod tests {
     fn relative_path_passthrough_when_not_prefixed() {
         let p = relative_display(Path::new("/other/x.rs"), Path::new("/wt"));
         assert_eq!(p, "/other/x.rs");
+    }
+
+    #[test]
+    fn hhmm_renders_local_clock_in_hh_colon_mm() {
+        // Timezone-agnostic: whatever the test machine's zone, the output is a
+        // valid HH:MM string (no panic, no UTC-only assumption).
+        let s = hhmm(1_700_000_000_000);
+        assert_eq!(s.len(), 5, "HH:MM is five chars");
+        assert_eq!(&s[2..3], ":", "colon separator at index 2");
+        assert!(
+            s[..2]
+                .bytes()
+                .chain(s[3..].bytes())
+                .all(|b| b.is_ascii_digit()),
+            "hours and minutes are digits: {s}"
+        );
+        let (h, m) = (
+            s[..2].parse::<u32>().unwrap(),
+            s[3..].parse::<u32>().unwrap(),
+        );
+        assert!(h < 24 && m < 60, "valid wall-clock values: {s}");
     }
 
     #[test]
@@ -509,8 +532,10 @@ mod tests {
     fn edit_line_connector_time_stats_and_summary() {
         let line = edit_line(0, 12, 3, "guard repin()", false, false, 44);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        // Timezone-agnostic: the time is rendered in local time, so derive the
+        // expected HH:MM from hhmm rather than assuming UTC.
         assert!(
-            text.starts_with("  ├ 00:00"),
+            text.starts_with(&format!("  ├ {}", hhmm(0))),
             "indent, branch connector, time"
         );
         assert!(text.contains("+12"));
