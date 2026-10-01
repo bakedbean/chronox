@@ -1,7 +1,8 @@
 # chronox
 
 A standalone [ratatui](https://ratatui.rs) terminal UI for browsing the
-newest-first timeline of file changes a Claude Code agent made in a worktree,
+newest-first timeline of file changes a coding agent (Claude Code, Codex, or pi)
+made in a worktree,
 with a syntax-highlighted diff of the selected change. The timeline updates live
 while a session is running.
 
@@ -37,9 +38,12 @@ chronox                      # current directory
 chronox /path/to/worktree    # an explicit worktree
 ```
 
-The worktree must have Claude Code session logs
-(`~/.claude/projects/<encoded-worktree>/*.jsonl`) — run a Claude Code session in
-it (and make a few edits) first, or you'll see the empty state.
+The worktree must have agent session logs — Claude Code
+(`~/.claude/projects/<encoded-worktree>/*.jsonl`), Codex
+(`~/.codex/sessions/**/rollout-*.jsonl` whose recorded cwd is the worktree), or
+pi (`~/.pi/agent/sessions/<encoded-worktree>/*.jsonl`). Sessions from every
+harness are merged into one timeline. Run a session in it (and make a few edits)
+first, or you'll see the empty state.
 
 ## Keys
 

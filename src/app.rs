@@ -7,7 +7,7 @@ use ratatui::text::Line;
 use std::path::PathBuf;
 
 use crate::render::change_detail_lines_styled;
-use sessionx::extract::{claude_session_files, load_full_change, resolve_line_in_file};
+use sessionx::extract::{load_full_change, resolve_line_in_file, session_files};
 use sessionx::nav::nav;
 use sessionx::{
     ChangeEvent, ChangeSource, ChangeTool, NavAction, NavKey, SideRow, Timeline,
@@ -464,7 +464,7 @@ impl App {
     /// re-pin the cursor to the same change. Cheap to call on a tick — the
     /// sessionx `Timeline` reparses only files whose size/mtime changed.
     fn refresh(&mut self) {
-        let files = claude_session_files(&self.worktree);
+        let files = session_files(&self.worktree);
         self.timeline.refresh(&files);
         let events = self.timeline.events().to_vec();
         self.set_events_and_rebuild(events);
