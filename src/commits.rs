@@ -17,10 +17,11 @@
 //!   whose command ran `git commit`, again only within a session's span — this
 //!   catches quiet commits whose reflog has since been lost.
 //!
-//! A committed file is skipped when an edit tool already recorded a change to
-//! it since the previous commit, so tool-tracked edits are never shown twice.
+//! A commit hunk is skipped when edit tools already recorded its change since
+//! the previous commit, so tool-tracked edits are never shown twice, while a
+//! shell edit to the same file still is.
 
-use sessionx::extract::parse_iso8601_ms;
+use sessionx::extract::{load_full_change, parse_iso8601_ms};
 use sessionx::{ChangeDetail, ChangeEvent, ChangeSource, ChangeTool};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
@@ -109,11 +110,22 @@ pub struct CommitIndex {
     loaded: HashMap<String, Commit>,
     /// `git rev-parse --show-toplevel`, once it succeeds.
     toplevel: Option<PathBuf>,
+    /// Normalized lines of each tool event's full change, keyed by its source.
+    tool_lines: HashMap<(PathBuf, usize, usize), ToolLines>,
     /// Full sha -> (HEAD it was checked against, reachable from that HEAD).
     reachable: HashMap<String, (String, bool)>,
+    /// (a, b) -> a is an ancestor of b. Immutable, so cached for good.
+    ancestry: HashMap<(String, String), bool>,
     /// The events returned by the last refresh and the tool-event count they
     /// were built against, reused until a log grows.
     last: Option<(usize, Vec<ChangeEvent>)>,
+}
+
+/// The lines an edit tool removed and wrote, normalized by `norm`.
+#[derive(Debug, Default)]
+struct ToolLines {
+    old: HashSet<String>,
+    new: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -222,9 +234,43 @@ impl CommitIndex {
             .filter(|r| r.amend)
             .map(|r| r.sha.as_str())
             .collect();
+        // Pairs that may be versions of one commit — same patch (rebase), same
+        // subject (rebase with conflicts), or an amend of a sibling — count only
+        // when neither is an ancestor of the other: a change reapplied after
+        // its revert is history, not a rewrite.
+        let mut versions: Vec<(usize, usize)> = Vec::new();
+        for i in 0..commits.len() {
+            for j in i + 1..commits.len() {
+                let (a, b) = (commits[i], commits[j]);
+                let amend = a.parent == b.parent
+                    && (amends.contains(a.full.as_str()) || amends.contains(b.full.as_str()));
+                if a.patch_id != b.patch_id && a.subject != b.subject && !amend {
+                    continue;
+                }
+                let mut ancestor = |x: &str, y: &str| {
+                    *self
+                        .ancestry
+                        .entry((x.to_string(), y.to_string()))
+                        .or_insert_with(|| {
+                            git(&toplevel, &["merge-base", "--is-ancestor", x, y]).is_some()
+                        })
+                };
+                if !ancestor(&a.full, &b.full) && !ancestor(&b.full, &a.full) {
+                    versions.push((i, j));
+                }
+            }
+        }
         let reachable = |c: &Commit| self.reachable.get(&c.full).is_some_and(|(_, r)| *r);
-        let kept = drop_superseded(commits, &reachable, &amends);
-        let events = build_events(&toplevel, worktree, kept, tool_events);
+        let kept = collapse_versions(&commits, &versions, &reachable);
+        for e in tool_events {
+            self.tool_lines
+                .entry(source_key(&e.source))
+                .or_insert_with(|| {
+                    // The timeline's detail is clipped; coverage needs every line.
+                    tool_lines(&load_full_change(e).unwrap_or_else(|| e.detail.clone()))
+                });
+        }
+        let events = build_events(&toplevel, worktree, kept, tool_events, &self.tool_lines);
         self.last = Some((tool_events.len(), events.clone()));
         events
     }
@@ -263,57 +309,109 @@ fn patch_id(patch: &str) -> u64 {
     h.finish()
 }
 
-/// Drop commits that history has replaced, returning the rest with the time to
-/// show them at, oldest-first. A commit is replaced only when HEAD no longer
-/// reaches it *and* a reachable commit took its place:
-/// - a rebased copy (same patch) — shown at the original's time, when the edit
-///   was actually made;
-/// - an amended version (same parent, and same subject or an amend per the
-///   reflog).
-///
-/// Reachable commits are never dropped, so a change reapplied after a revert,
-/// or two branches from one base, all stay.
-fn drop_superseded<'a>(
-    commits: Vec<&'a Commit>,
+/// Collapse each group of commits linked by `versions` (pairs of indices
+/// into `commits`) into one, returning the survivors with the time to show
+/// each at, oldest-first. A group keeps the version HEAD reaches (else the
+/// newest — e.g. the amend) and is shown at its earliest version's time, when
+/// the edit was actually made.
+fn collapse_versions<'a>(
+    commits: &[&'a Commit],
+    versions: &[(usize, usize)],
     reachable: &dyn Fn(&Commit) -> bool,
-    amends: &HashSet<&str>,
 ) -> Vec<(&'a Commit, i64)> {
-    let live: Vec<&Commit> = commits.iter().copied().filter(|c| reachable(c)).collect();
-    let mut shown: HashMap<&str, i64> = live.iter().map(|c| (c.full.as_str(), c.ts_ms)).collect();
-    let mut kept: Vec<&Commit> = live.clone();
-    for c in commits.iter().copied().filter(|c| !reachable(c)) {
-        if let Some(copy) = live.iter().find(|l| l.patch_id == c.patch_id) {
-            let t = shown.get_mut(copy.full.as_str()).expect("live commit");
-            *t = (*t).min(c.ts_ms);
-            continue;
+    let mut group: Vec<usize> = (0..commits.len()).collect();
+    fn root(group: &mut [usize], mut i: usize) -> usize {
+        while group[i] != i {
+            group[i] = group[group[i]];
+            i = group[i];
         }
-        let amended = live.iter().any(|l| {
-            l.parent == c.parent && (l.subject == c.subject || amends.contains(l.full.as_str()))
-        });
-        if !amended {
-            kept.push(c);
-            shown.insert(c.full.as_str(), c.ts_ms);
-        }
+        i
     }
-    let mut out: Vec<(&Commit, i64)> = kept
-        .into_iter()
-        .map(|c| (c, shown[c.full.as_str()]))
+    for &(a, b) in versions {
+        let (ra, rb) = (root(&mut group, a), root(&mut group, b));
+        group[ra] = rb;
+    }
+    let mut groups: HashMap<usize, Vec<&Commit>> = HashMap::new();
+    for (i, c) in commits.iter().enumerate() {
+        groups.entry(root(&mut group, i)).or_default().push(c);
+    }
+    let mut out: Vec<(&Commit, i64)> = groups
+        .into_values()
+        .map(|g| {
+            let keep = g
+                .iter()
+                .max_by_key(|c| (reachable(c), c.ts_ms))
+                .expect("non-empty group");
+            let first = g.iter().map(|c| c.ts_ms).min().expect("non-empty group");
+            (*keep, first)
+        })
         .collect();
-    out.sort_by_key(|(_, t)| *t);
+    out.sort_by(|(a, ta), (b, tb)| ta.cmp(tb).then_with(|| a.full.cmp(&b.full)));
     out
 }
 
-/// Turn `commits` (oldest-first) into events, skipping a commit's file when an
-/// edit tool changed that file after the previous commit and up to this one.
+fn source_key(src: &ChangeSource) -> (PathBuf, usize, usize) {
+    (src.session_file.clone(), src.line_index, src.index_in_line)
+}
+
+/// Compare lines ignoring whitespace, so a formatter run by a commit hook
+/// doesn't hide that a tool already made the change.
+fn norm(line: &str) -> String {
+    line.split_whitespace().collect()
+}
+
+fn tool_lines(detail: &ChangeDetail) -> ToolLines {
+    let set = |s: &str| s.lines().map(norm).filter(|l| !l.is_empty()).collect();
+    match detail {
+        ChangeDetail::Edit { old, new } => ToolLines {
+            old: set(old),
+            new: set(new),
+        },
+        ChangeDetail::Write { head } => ToolLines {
+            old: HashSet::new(),
+            new: set(head),
+        },
+        ChangeDetail::None => ToolLines::default(),
+    }
+}
+
+/// The non-blank lines a hunk removed and added (context excluded),
+/// normalized by `norm`.
+fn changed_lines(old: &str, new: &str) -> (Vec<String>, Vec<String>) {
+    let mut removed: Vec<String> = old.lines().map(norm).filter(|l| !l.is_empty()).collect();
+    let mut added: Vec<String> = Vec::new();
+    for l in new.lines().map(norm).filter(|l| !l.is_empty()) {
+        match removed.iter().position(|r| *r == l) {
+            Some(i) => {
+                removed.swap_remove(i); // unchanged context
+            }
+            None => added.push(l),
+        }
+    }
+    (removed, added)
+}
+
+/// Commit times have one-second resolution; tool events have milliseconds.
+const COMMIT_TS_PRECISION_MS: i64 = 999;
+
+/// Turn `commits` (oldest-first, with the time to show each at) into events,
+/// one per hunk. A hunk is skipped when edit tools that changed its file since
+/// the previous commit removed and wrote every line it did. Both window ends
+/// are widened by the commits' one-second precision: coverage compares
+/// content, so an edit counted in two windows can't be misattributed.
 fn build_events(
     toplevel: &Path,
     worktree: &Path,
     commits: Vec<(&Commit, i64)>,
     tool_events: &[ChangeEvent],
+    tool_lines: &HashMap<(PathBuf, usize, usize), ToolLines>,
 ) -> Vec<ChangeEvent> {
-    let tool_paths: Vec<(PathBuf, i64)> = tool_events
+    let tools: Vec<(PathBuf, i64, &ToolLines)> = tool_events
         .iter()
-        .map(|e| (absolutize(worktree, &e.file_path), e.timestamp_ms))
+        .filter_map(|e| {
+            let lines = tool_lines.get(&source_key(&e.source))?;
+            Some((absolutize(worktree, &e.file_path), e.timestamp_ms, lines))
+        })
         .collect();
     let mut out = Vec::new();
     let mut prev_ts = i64::MIN;
@@ -323,12 +421,27 @@ fn build_events(
         let source_file = PathBuf::from(format!("git:{}", c.full));
         for (fi, f) in c.files.iter().enumerate() {
             let path = toplevel.join(&f.path);
-            let covered = tool_paths
+            let window: Vec<&ToolLines> = tools
                 .iter()
-                .any(|(p, ts)| *p == path && *ts > prev_ts && *ts <= ts_ms);
-            if covered {
-                continue;
-            }
+                .filter(|(p, ts, _)| {
+                    *p == path
+                        && *ts > prev_ts.saturating_sub(COMMIT_TS_PRECISION_MS)
+                        && *ts <= ts_ms + COMMIT_TS_PRECISION_MS
+                })
+                .map(|(_, _, l)| *l)
+                .collect();
+            let covered = |old: &str, new: &str| {
+                if window.is_empty() {
+                    return false;
+                }
+                let (removed, added) = changed_lines(old, new);
+                removed
+                    .iter()
+                    .all(|l| window.iter().any(|w| w.old.contains(l)))
+                    && added
+                        .iter()
+                        .all(|l| window.iter().any(|w| w.new.contains(l)))
+            };
             let mk = |hi: usize, tool: ChangeTool, detail: ChangeDetail| ChangeEvent {
                 timestamp_ms: ts_ms,
                 tool,
@@ -342,14 +455,14 @@ fn build_events(
                 },
             };
             match &f.change {
-                FileChange::Added(content) => out.push(mk(
+                FileChange::Added(content) if !covered("", content) => out.push(mk(
                     0,
                     ChangeTool::Write,
                     ChangeDetail::Write {
                         head: content.clone(),
                     },
                 )),
-                FileChange::Deleted(content) => out.push(mk(
+                FileChange::Deleted(content) if !covered(content, "") => out.push(mk(
                     0,
                     ChangeTool::Edit,
                     ChangeDetail::Edit {
@@ -359,16 +472,19 @@ fn build_events(
                 )),
                 FileChange::Modified(hunks) => {
                     for (hi, (old, new)) in hunks.iter().enumerate() {
-                        out.push(mk(
-                            hi,
-                            ChangeTool::Edit,
-                            ChangeDetail::Edit {
-                                old: old.clone(),
-                                new: new.clone(),
-                            },
-                        ));
+                        if !covered(old, new) {
+                            out.push(mk(
+                                hi,
+                                ChangeTool::Edit,
+                                ChangeDetail::Edit {
+                                    old: old.clone(),
+                                    new: new.clone(),
+                                },
+                            ));
+                        }
                     }
                 }
+                _ => {}
             }
         }
         prev_ts = ts_ms;
@@ -1005,21 +1121,72 @@ Binary files a/img.png and b/img.png differ
     }
 
     #[test]
-    fn refresh_skips_files_an_edit_tool_already_recorded() {
+    fn refresh_skips_hunks_an_edit_tool_already_recorded() {
         let (_dir, repo, log) = fixture();
         let mut idx = CommitIndex::default();
         let commit_ts = idx.refresh(&repo, &[PathBuf::from(&log)], &[])[0].timestamp_ms;
+        // Same second as the commit but after its truncated timestamp, and
+        // reformatted (as a commit hook might).
         let tool_edit = ChangeEvent {
-            timestamp_ms: commit_ts - 1,
+            timestamp_ms: commit_ts + 400,
             tool: ChangeTool::Edit,
             file_path: repo.join("a.txt"),
             summary: String::new(),
-            detail: ChangeDetail::None,
+            detail: ChangeDetail::Edit {
+                old: "two".into(),
+                new: "  TWO  ".into(),
+            },
             source: ChangeSource::default(),
         };
         let evs = idx.refresh(&repo, &[PathBuf::from(&log)], &[tool_edit]);
         let files: Vec<_> = evs.iter().map(|e| e.file_path.clone()).collect();
         assert_eq!(files, vec![repo.join("b.txt")]);
+    }
+
+    #[test]
+    fn refresh_keeps_a_shell_hunk_beside_a_tool_edit_in_the_same_file() {
+        let (_dir, repo, _) = fixture();
+        let lines: Vec<String> = (1..=12).map(|i| format!("line {i}")).collect();
+        std::fs::write(repo.join("m.txt"), lines.join("\n") + "\n").unwrap();
+        run_git_at(&repo, Some("2001-01-02T00:00:00Z"), &["add", "m.txt"]);
+        run_git_at(
+            &repo,
+            Some("2001-01-02T00:00:00Z"),
+            &["commit", "-q", "-m", "m"],
+        );
+        let mut edited = lines.clone();
+        edited[1] = "tool edit".into(); // via Edit
+        edited[10] = "sed edit".into(); // via the shell
+        std::fs::write(repo.join("m.txt"), edited.join("\n") + "\n").unwrap();
+        run_git(&repo, &["commit", "-q", "-am", "mixed"]);
+        let commit_s: i64 = run_git(&repo, &["show", "-s", "--format=%ct"])
+            .trim()
+            .parse()
+            .unwrap();
+        let tool_edit = ChangeEvent {
+            timestamp_ms: commit_s * 1000 + 300,
+            tool: ChangeTool::Edit,
+            file_path: repo.join("m.txt"),
+            summary: String::new(),
+            detail: ChangeDetail::Edit {
+                old: "line 2".into(),
+                new: "tool edit".into(),
+            },
+            source: ChangeSource::default(),
+        };
+        let evs = CommitIndex::default().refresh(&repo, &[quiet_log(&repo)], &[tool_edit]);
+        let m: Vec<_> = evs
+            .iter()
+            .filter(|e| e.file_path == repo.join("m.txt"))
+            .map(|e| e.detail.clone())
+            .collect();
+        assert_eq!(
+            m,
+            vec![ChangeDetail::Edit {
+                old: "line 10\nline 11\nline 12".into(),
+                new: "line 10\nsed edit\nline 12".into(),
+            }]
+        );
     }
 
     #[test]
