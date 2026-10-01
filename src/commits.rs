@@ -61,6 +61,9 @@ struct CommitMeta {
     parent: String,
     ts_ms: i64,
     subject: String,
+    /// `<author time> <author email>`: kept by rebase, cherry-pick and amend,
+    /// so it identifies one authored change across its rewrites.
+    authored: String,
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +72,7 @@ struct Commit {
     parent: String,
     ts_ms: i64,
     subject: String,
+    authored: String,
     files: Vec<FileDiff>,
     /// Hash of the patch's added/removed lines (not context or line numbers),
     /// like `git patch-id`: equal across a rebase that applied cleanly.
@@ -249,34 +253,48 @@ impl CommitIndex {
             .filter(|r| r.amend)
             .map(|r| r.sha.as_str())
             .collect();
-        // Pairs that may be versions of one commit — same patch (rebase), same
-        // subject (rebase with conflicts), or an amend of a sibling — count only
-        // when neither is an ancestor of the other: a change reapplied after
-        // its revert is history, not a rewrite.
-        let mut versions: Vec<(usize, usize)> = Vec::new();
+        // Group versions of one authored change. Two commits are versions when
+        // they share an author (time and email, which rebase, cherry-pick and
+        // amend keep) and the same patch or subject — or the reflog records
+        // one as an amend of its sibling. A group never holds two
+        // commits where one is an ancestor of the other: a change reapplied
+        // after its revert is history, not a rewrite.
+        let ancestry = &mut self.ancestry;
+        let mut ancestor = |x: &str, y: &str| {
+            *ancestry
+                .entry((x.to_string(), y.to_string()))
+                .or_insert_with(|| git(&toplevel, &["merge-base", "--is-ancestor", x, y]).is_some())
+        };
+        let mut groups: Vec<Vec<usize>> = (0..commits.len()).map(|i| vec![i]).collect();
+        let mut group_of: Vec<usize> = (0..commits.len()).collect();
         for i in 0..commits.len() {
             for j in i + 1..commits.len() {
                 let (a, b) = (commits[i], commits[j]);
+                let rewrite = a.authored == b.authored
+                    && (a.patch_id == b.patch_id || a.subject == b.subject);
                 let amend = a.parent == b.parent
                     && (amends.contains(a.full.as_str()) || amends.contains(b.full.as_str()));
-                if a.patch_id != b.patch_id && a.subject != b.subject && !amend {
+                let (gi, gj) = (group_of[i], group_of[j]);
+                if !(rewrite || amend) || gi == gj {
                     continue;
                 }
-                let mut ancestor = |x: &str, y: &str| {
-                    *self
-                        .ancestry
-                        .entry((x.to_string(), y.to_string()))
-                        .or_insert_with(|| {
-                            git(&toplevel, &["merge-base", "--is-ancestor", x, y]).is_some()
-                        })
-                };
-                if !ancestor(&a.full, &b.full) && !ancestor(&b.full, &a.full) {
-                    versions.push((i, j));
+                let related = groups[gi].iter().any(|&x| {
+                    groups[gj].iter().any(|&y| {
+                        ancestor(&commits[x].full, &commits[y].full)
+                            || ancestor(&commits[y].full, &commits[x].full)
+                    })
+                });
+                if !related {
+                    let moved = std::mem::take(&mut groups[gj]);
+                    for &k in &moved {
+                        group_of[k] = gi;
+                    }
+                    groups[gi].extend(moved);
                 }
             }
         }
         let reachable = |c: &Commit| self.reachable.get(&c.full).is_some_and(|(_, r)| *r);
-        let kept = collapse_versions(&commits, &versions, &reachable);
+        let kept = collapse_versions(&commits, &groups, &reachable);
         for e in tool_events {
             self.tool_lines
                 .entry(source_key(&e.source))
@@ -324,41 +342,30 @@ fn patch_id(patch: &str) -> u64 {
     h.finish()
 }
 
-/// Collapse each group of commits linked by `versions` (pairs of indices
-/// into `commits`) into one, returning the survivors with the time to show
-/// each at, oldest-first. A group keeps the version HEAD reaches (else the
-/// newest — e.g. the amend) and is shown at its earliest version's time, when
-/// the edit was actually made.
+/// Collapse each group of versions (indices into `commits`) into one,
+/// returning the survivors with the time to show each at, oldest-first. A
+/// group keeps the version HEAD reaches (else the newest — e.g. the amend)
+/// and is shown at its earliest version's time, when the edit was made.
 fn collapse_versions<'a>(
     commits: &[&'a Commit],
-    versions: &[(usize, usize)],
+    groups: &[Vec<usize>],
     reachable: &dyn Fn(&Commit) -> bool,
 ) -> Vec<(&'a Commit, i64)> {
-    let mut group: Vec<usize> = (0..commits.len()).collect();
-    fn root(group: &mut [usize], mut i: usize) -> usize {
-        while group[i] != i {
-            group[i] = group[group[i]];
-            i = group[i];
-        }
-        i
-    }
-    for &(a, b) in versions {
-        let (ra, rb) = (root(&mut group, a), root(&mut group, b));
-        group[ra] = rb;
-    }
-    let mut groups: HashMap<usize, Vec<&Commit>> = HashMap::new();
-    for (i, c) in commits.iter().enumerate() {
-        groups.entry(root(&mut group, i)).or_default().push(c);
-    }
     let mut out: Vec<(&Commit, i64)> = groups
-        .into_values()
+        .iter()
+        .filter(|g| !g.is_empty())
         .map(|g| {
             let keep = g
                 .iter()
+                .map(|&i| commits[i])
                 .max_by_key(|c| (reachable(c), c.ts_ms))
                 .expect("non-empty group");
-            let first = g.iter().map(|c| c.ts_ms).min().expect("non-empty group");
-            (*keep, first)
+            let first = g
+                .iter()
+                .map(|&i| commits[i].ts_ms)
+                .min()
+                .expect("non-empty group");
+            (keep, first)
         })
         .collect();
     out.sort_by(|(a, ta), (b, tb)| ta.cmp(tb).then_with(|| a.full.cmp(&b.full)));
@@ -733,11 +740,20 @@ fn git_toplevel(worktree: &Path) -> Option<PathBuf> {
 /// commit made in another repository) and merge commits.
 fn commit_meta(dir: &Path, sha: &str) -> Option<CommitMeta> {
     let rev = format!("{sha}^{{commit}}");
-    let meta = git(dir, &["show", "-s", "--format=%H%x00%P%x00%ct%x00%s", &rev])?;
-    let mut parts = meta.trim_end_matches('\n').splitn(4, '\0');
+    let meta = git(
+        dir,
+        &[
+            "show",
+            "-s",
+            "--format=%H%x00%P%x00%ct%x00%at %ae%x00%s",
+            &rev,
+        ],
+    )?;
+    let mut parts = meta.trim_end_matches('\n').splitn(5, '\0');
     let full = parts.next()?.to_string();
     let parents = parts.next()?;
     let ts: i64 = parts.next()?.parse().ok()?;
+    let authored = parts.next()?.to_string();
     let subject = parts.next().unwrap_or("").to_string();
     if parents.split_whitespace().count() > 1 {
         return None;
@@ -747,6 +763,7 @@ fn commit_meta(dir: &Path, sha: &str) -> Option<CommitMeta> {
         parent: parents.trim().to_string(),
         ts_ms: ts * 1000,
         subject,
+        authored,
     })
 }
 
@@ -773,6 +790,7 @@ fn load_commit(dir: &Path, m: CommitMeta) -> Option<Commit> {
         parent: m.parent,
         ts_ms: m.ts_ms,
         subject: m.subject,
+        authored: m.authored,
         files: parse_patch(&patch),
         patch_id: patch_id(&patch),
     })
@@ -1474,6 +1492,74 @@ Binary files a/img.png and b/img.png differ
             .filter(|e| e.file_path == repo.join("a.txt"))
             .count();
         assert_eq!(a, 3, "apply, revert, reapply: {:?}", summaries(&evs));
+    }
+
+    #[test]
+    fn refresh_keeps_same_subject_siblings_by_different_authorship() {
+        let (_dir, repo, _) = fixture();
+        run_git(&repo, &["checkout", "-q", "-b", "left"]);
+        std::fs::write(repo.join("l.txt"), "l\n").unwrap();
+        run_git(&repo, &["add", "l.txt"]);
+        run_git_at(
+            &repo,
+            Some("2001-01-03T00:00:00Z"),
+            &["commit", "-q", "-m", "wip"],
+        );
+        run_git(&repo, &["checkout", "-q", "-b", "right", "HEAD~1"]);
+        std::fs::write(repo.join("r.txt"), "r\n").unwrap();
+        run_git(&repo, &["add", "r.txt"]);
+        run_git_at(
+            &repo,
+            Some("2001-01-04T00:00:00Z"),
+            &["commit", "-q", "-m", "wip"],
+        );
+        // Reported by the session, though authored at other times.
+        let shas = run_git(&repo, &["log", "--all", "--format=%h %s", "-2"]);
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let line = serde_json::json!({"timestamp": now, "o": shas.lines()
+            .map(|l| format!("[x {}] wip", l.split(' ').next().unwrap())).collect::<Vec<_>>().join("\n")});
+        let log = repo.join("s.jsonl");
+        // Spans the 2001 commit times too.
+        let old = serde_json::json!({"timestamp": "2001-01-01T00:00:00.000Z"});
+        std::fs::write(&log, format!("{old}\n{line}\n")).unwrap();
+        let evs = CommitIndex::default().refresh(&repo, &[log], &[]);
+        assert!(
+            evs.iter().any(|e| e.file_path == repo.join("l.txt")),
+            "{evs:#?}"
+        );
+        assert!(
+            evs.iter().any(|e| e.file_path == repo.join("r.txt")),
+            "{evs:#?}"
+        );
+    }
+
+    #[test]
+    fn refresh_does_not_let_a_rebased_copy_bridge_a_reapply() {
+        let (_dir, repo, _) = fixture();
+        let a = run_git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+        let branch = run_git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        run_git(&repo, &["revert", "--no-edit", &a]);
+        run_git(&repo, &["cherry-pick", &a]); // C: reapply, A is its ancestor
+        run_git(&repo, &["checkout", "-q", "-b", "other", &format!("{a}~1")]);
+        std::fs::write(repo.join("c.txt"), "c\n").unwrap();
+        run_git(&repo, &["add", "c.txt"]);
+        run_git(&repo, &["commit", "-q", "-m", "elsewhere"]);
+        run_git(&repo, &["cherry-pick", &a]); // X: a rebased copy of A
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let shas = run_git(&repo, &["log", "--all", "--format=%h %s"]);
+        let call = serde_json::json!({"timestamp": now, "message": {"content": [
+            {"type": "tool_use", "id": "c", "input": {"command": "git commit; git log --all --oneline"}}]}});
+        let result = serde_json::json!({"timestamp": now, "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "c", "content": shas}]}});
+        let log = repo.join("s.jsonl");
+        std::fs::write(&log, format!("{call}\n{result}\n")).unwrap();
+        run_git(&repo, &["checkout", "-q", branch.trim()]);
+        let evs = CommitIndex::default().refresh(&repo, &[log], &[]);
+        let a_edits = evs
+            .iter()
+            .filter(|e| e.file_path == repo.join("a.txt"))
+            .count();
+        assert_eq!(a_edits, 3, "apply, revert, reapply: {:?}", summaries(&evs));
     }
 
     #[test]
