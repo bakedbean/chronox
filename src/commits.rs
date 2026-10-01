@@ -9,7 +9,10 @@
 //! - `[branch sha] subject` output of a `git commit` in a session log;
 //! - the worktree's HEAD reflog entries (`commit:`, `commit (amend):`, …) whose
 //!   commit time falls within a session's span — this catches `git commit -q`,
-//!   which prints nothing.
+//!   which prints nothing;
+//! - `<sha> <subject>` lines (`git log --oneline`) in the output of a tool call
+//!   whose command ran `git commit`, again only within a session's span — this
+//!   catches quiet commits whose reflog has since been lost.
 //!
 //! A committed file is skipped when an edit tool already recorded a change to
 //! it since the previous commit, so tool-tracked edits are never shown twice.
@@ -53,6 +56,9 @@ struct Commit {
     ts_ms: i64,
     subject: String,
     files: Vec<FileDiff>,
+    /// Hash of the patch's added/removed lines (not context or line numbers),
+    /// like `git patch-id`: equal across a rebase that applied cleanly.
+    patch_id: u64,
 }
 
 /// Incremental scan state for one session log.
@@ -62,6 +68,13 @@ struct LogScan {
     offset: u64,
     /// Commit shas reported by `git commit` output, in order of appearance.
     shas: Vec<String>,
+    /// Shas from `--oneline`-style lines in the output of a `git commit` tool
+    /// call. Weaker evidence (it may list older commits too), so these are
+    /// only used when the commit time falls within a session's span.
+    oneline_shas: Vec<String>,
+    /// Ids of tool calls whose input mentions `git commit`; their results are
+    /// scanned for `oneline_shas`.
+    commit_calls: HashSet<String>,
     /// Earliest and latest line `timestamp` seen, epoch ms.
     span: Option<(i64, i64)>,
 }
@@ -118,29 +131,34 @@ impl CommitIndex {
                 .iter()
                 .any(|(lo, hi)| ts >= lo - SPAN_SLACK_MS && ts <= hi + SPAN_SLACK_MS)
         };
-        let candidates: Vec<String> = self
+        // (sha, must the commit time fall within a session?)
+        let candidates: Vec<(String, bool)> = self
             .scanned
             .values()
-            .flat_map(|s| s.shas.iter().cloned())
+            .flat_map(|s| {
+                let strong = s.shas.iter().map(|sha| (sha.clone(), false));
+                strong.chain(s.oneline_shas.iter().map(|sha| (sha.clone(), true)))
+            })
             .chain(
                 self.reflog
                     .iter()
                     .flatten()
                     .filter(|(_, ts)| in_session(*ts))
-                    .map(|(sha, _)| sha.clone()),
+                    .map(|(sha, _)| (sha.clone(), false)),
             )
             .collect();
 
         let mut commits: Vec<&Commit> = Vec::new();
         let mut seen = HashSet::new();
-        for sha in &candidates {
+        for (sha, _) in &candidates {
             if !self.resolved.contains_key(sha) {
                 let commit = resolve_commit(&toplevel, sha);
                 self.resolved.insert(sha.clone(), commit);
             }
         }
-        for sha in &candidates {
+        for (sha, needs_span) in &candidates {
             if let Some(Some(c)) = self.resolved.get(sha)
+                && (!needs_span || in_session(c.ts_ms))
                 && seen.insert(c.full.as_str())
             {
                 commits.push(c);
@@ -169,11 +187,25 @@ fn reflog_commits(dir: &Path) -> Vec<(String, i64)> {
         .collect()
 }
 
-/// Keep only the newest of commits that share a parent: `git commit --amend`
-/// (or a reset and recommit) replaces the earlier one, whose changes would
-/// otherwise show twice.
+fn patch_id(patch: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    patch
+        .lines()
+        .filter(|l| l.starts_with('+') || l.starts_with('-'))
+        .for_each(|l| l.hash(&mut h));
+    h.finish()
+}
+
+/// Collapse commits that are versions of the same change, oldest-first:
+/// - a rebased copy has the same patch as its original; keep the original,
+///   whose time is when the edit was actually made;
+/// - `git commit --amend` (or a reset and recommit) makes a sibling with the
+///   same parent; keep the newest, which replaced the earlier one.
 fn drop_amended(mut commits: Vec<&Commit>) -> Vec<&Commit> {
     commits.sort_by_key(|c| c.ts_ms);
+    let mut patches = HashSet::new();
+    commits.retain(|c| patches.insert(c.patch_id));
     let mut newest: HashMap<&str, usize> = HashMap::new();
     for (i, c) in commits.iter().enumerate() {
         newest.insert(c.parent.as_str(), i);
@@ -327,6 +359,18 @@ fn scan_log(path: &Path, scan: &mut LogScan) {
                 }
             });
         }
+        if line.contains("git commit") {
+            record_commit_calls(&v, &mut scan.commit_calls);
+        }
+        if !scan.commit_calls.is_empty() {
+            visit_commit_results(&v, &scan.commit_calls, &mut |s| {
+                for sha in oneline_shas_in(s) {
+                    if !scan.oneline_shas.contains(&sha) {
+                        scan.oneline_shas.push(sha);
+                    }
+                }
+            });
+        }
     }
     scan.offset += end as u64 + 1;
 }
@@ -340,6 +384,67 @@ fn visit_strings(v: &serde_json::Value, f: &mut impl FnMut(&str)) {
         serde_json::Value::Object(o) => o.values().for_each(|x| visit_strings(x, f)),
         _ => {}
     }
+}
+
+/// Keys naming a tool call on the call itself (Claude `tool_use.id`, pi
+/// `toolCall.id`, Codex `function_call.call_id`) and on its result (Claude
+/// `tool_use_id`, pi `toolCallId`, Codex `function_call_output.call_id`).
+const CALL_ID_KEYS: [&str; 2] = ["id", "call_id"];
+const RESULT_ID_KEYS: [&str; 3] = ["tool_use_id", "toolCallId", "call_id"];
+
+fn str_key<'a>(
+    o: &'a serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<&'a str> {
+    keys.iter().find_map(|k| o.get(*k).and_then(|v| v.as_str()))
+}
+
+/// Record the id of every object carrying a call id whose contents mention
+/// `git commit` — i.e. the tool calls that committed.
+fn record_commit_calls(v: &serde_json::Value, calls: &mut HashSet<String>) {
+    match v {
+        serde_json::Value::Object(o) => {
+            if let Some(id) = str_key(o, &CALL_ID_KEYS) {
+                let mut mentions = false;
+                visit_strings(v, &mut |s| mentions |= s.contains("git commit"));
+                if mentions {
+                    calls.insert(id.to_string());
+                }
+            }
+            o.values().for_each(|x| record_commit_calls(x, calls));
+        }
+        serde_json::Value::Array(a) => a.iter().for_each(|x| record_commit_calls(x, calls)),
+        _ => {}
+    }
+}
+
+/// Call `f` on every string inside the results of the tool calls in `calls`.
+fn visit_commit_results(v: &serde_json::Value, calls: &HashSet<String>, f: &mut impl FnMut(&str)) {
+    match v {
+        serde_json::Value::Object(o) => {
+            if str_key(o, &RESULT_ID_KEYS).is_some_and(|id| calls.contains(id)) {
+                visit_strings(v, f);
+            } else {
+                o.values().for_each(|x| visit_commit_results(x, calls, f));
+            }
+        }
+        serde_json::Value::Array(a) => a.iter().for_each(|x| visit_commit_results(x, calls, f)),
+        _ => {}
+    }
+}
+
+/// Shas leading `git log --oneline` lines: `<sha> <subject>`.
+fn oneline_shas_in(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let (sha, rest) = line.trim_start().split_once(' ')?;
+            (is_sha(sha) && !rest.trim().is_empty()).then(|| sha.to_string())
+        })
+        .collect()
+}
+
+fn is_sha(s: &str) -> bool {
+    (7..=40).contains(&s.len()) && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Shas from `git commit` output lines: `[<branch> <sha>] <subject>`, also
@@ -358,9 +463,7 @@ fn commit_shas_in(text: &str) -> Vec<String> {
         let (Some(_branch), Some(sha)) = (tokens.next(), tokens.next_back()) else {
             continue;
         };
-        let is_sha = (7..=40).contains(&sha.len())
-            && sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-        if is_sha {
+        if is_sha(sha) {
             out.push(sha.to_string());
         }
     }
@@ -420,6 +523,7 @@ fn resolve_commit(dir: &Path, sha: &str) -> Option<Commit> {
         ts_ms: ts * 1000,
         subject,
         files: parse_patch(&patch),
+        patch_id: patch_id(&patch),
     })
 }
 
@@ -563,6 +667,24 @@ mod tests {
             commit_shas_in(text),
             vec!["05ec84a", "1234567abc", "deadbeef"]
         );
+    }
+
+    #[test]
+    fn oneline_shas_come_only_from_commit_call_results() {
+        let call = serde_json::json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "t1", "input": {"command": "git commit -q -m x && git log --oneline -2"}},
+            {"type": "tool_use", "id": "t2", "input": {"command": "git log --oneline -1"}},
+        ]}});
+        let results = serde_json::json!({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "hook noise\n936370cff feat: x\nabc1234 older"},
+            {"type": "tool_result", "tool_use_id": "t2", "content": "1111111 not from a commit call"},
+        ]}});
+        let mut calls = HashSet::new();
+        record_commit_calls(&call, &mut calls);
+        assert!(calls.contains("t1") && !calls.contains("t2"), "{calls:?}");
+        let mut found = Vec::new();
+        visit_commit_results(&results, &calls, &mut |s| found.extend(oneline_shas_in(s)));
+        assert_eq!(found, vec!["936370cff", "abc1234"]);
     }
 
     #[test]
@@ -733,6 +855,47 @@ Binary files a/img.png and b/img.png differ
     }
 
     #[test]
+    fn refresh_finds_commits_listed_after_a_quiet_commit_without_reflog() {
+        let (_dir, repo, _) = fixture();
+        std::fs::write(repo.join("a.txt"), "one\nTWO\nthree\nfour\n").unwrap();
+        run_git(&repo, &["commit", "-q", "-am", "quiet"]);
+        let sha = run_git(&repo, &["rev-parse", "--short", "HEAD"]);
+        // Lose the reflog, as a recreated worktree does.
+        std::fs::remove_dir_all(repo.join(".git/logs")).unwrap();
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let call = serde_json::json!({"timestamp": now, "message": {"content": [
+            {"type": "tool_use", "id": "c1", "input": {"command": "git commit -q -m quiet && git log --oneline -1"}}]}});
+        let result = serde_json::json!({"timestamp": now, "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "c1", "content": format!("{} quiet", sha.trim())}]}});
+        let log = repo.join("quiet.jsonl");
+        std::fs::write(&log, format!("{call}\n{result}\n")).unwrap();
+        let evs = CommitIndex::default().refresh(&repo, &[log], &[]);
+        assert!(
+            evs.iter().any(|e| e.summary.ends_with(" quiet")),
+            "{evs:#?}"
+        );
+    }
+
+    #[test]
+    fn refresh_ignores_oneline_commits_outside_every_session() {
+        let (_dir, repo, _) = fixture();
+        std::fs::remove_dir_all(repo.join(".git/logs")).unwrap();
+        let sha = run_git(&repo, &["rev-parse", "--short", "HEAD"]);
+        let ts = "2020-01-01T00:00:00.000Z";
+        let call = serde_json::json!({"timestamp": ts, "message": {"content": [
+            {"type": "tool_use", "id": "c1", "input": {"command": "git commit && git log --oneline"}}]}});
+        let result = serde_json::json!({"timestamp": ts, "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "c1", "content": format!("{} shell edits", sha.trim())}]}});
+        let log = repo.join("old.jsonl");
+        std::fs::write(&log, format!("{call}\n{result}\n")).unwrap();
+        assert!(
+            CommitIndex::default()
+                .refresh(&repo, &[log], &[])
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn refresh_ignores_reflog_commits_outside_every_session() {
         let (_dir, repo, _) = fixture();
         let log = repo.join("old.jsonl");
@@ -742,6 +905,27 @@ Binary files a/img.png and b/img.png differ
                 .refresh(&repo, &[log], &[])
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn refresh_collapses_a_rebased_copy_into_its_original() {
+        let (_dir, repo, log) = fixture();
+        // Replay the same change onto a different parent, as a rebase does.
+        let original = run_git(&repo, &["rev-parse", "HEAD"]);
+        run_git(&repo, &["checkout", "-q", "-b", "other", "HEAD~1"]);
+        std::fs::write(repo.join("c.txt"), "unrelated\n").unwrap();
+        run_git(&repo, &["add", "c.txt"]);
+        run_git(&repo, &["commit", "-q", "-m", "unrelated"]);
+        let out = run_git(&repo, &["cherry-pick", original.trim()]);
+        let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        let line = serde_json::json!({"o": out});
+        writeln!(f, "{line}").unwrap();
+        let evs = CommitIndex::default().refresh(&repo, &[PathBuf::from(&log)], &[]);
+        let a_edits = evs
+            .iter()
+            .filter(|e| e.file_path == repo.join("a.txt"))
+            .count();
+        assert_eq!(a_edits, 1, "{evs:#?}");
     }
 
     #[test]
