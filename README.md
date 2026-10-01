@@ -45,6 +45,18 @@ pi (`~/.pi/agent/sessions/<encoded-worktree>/*.jsonl`). Sessions from every
 harness are merged into one timeline. Run a session in it (and make a few edits)
 first, or you'll see the empty state.
 
+### Shell edits and commits
+
+Agents don't always edit through an edit tool: a `sed -i`, a heredoc, or a
+script run from the shell leaves no Edit/Write call in the session log. chronox
+recovers those changes from the commits the agent made — found from `git commit`
+output in the session log and from the worktree's HEAD reflog entries that fall
+within a session's time span (which also catches `git commit -q`). Each hunk of
+such a commit appears as its own change, summarized as `<sha> <subject>`, at the
+commit's time. A committed file that an edit tool already recorded since the
+previous commit is not shown twice. Shell edits that were never committed can't
+be recovered.
+
 ## Keys
 
 | Key | Action |

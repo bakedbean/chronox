@@ -6,6 +6,7 @@ use ratatui::layout::Rect;
 use ratatui::text::Line;
 use std::path::PathBuf;
 
+use crate::commits::CommitIndex;
 use crate::render::change_detail_lines_styled;
 use sessionx::extract::{load_full_change, resolve_line_in_file, session_files};
 use sessionx::nav::nav;
@@ -125,6 +126,8 @@ enum SelTarget {
 pub struct App {
     pub worktree: PathBuf,
     timeline: Timeline,
+    /// Changes reconstructed from commits the agent made (shell edits).
+    commits: CommitIndex,
     events: Vec<ChangeEvent>,
     groups: Vec<FileGroup>,
     visible: Vec<VisibleRow>,
@@ -173,6 +176,7 @@ impl App {
         App {
             worktree,
             timeline: Timeline::default(),
+            commits: CommitIndex::default(),
             events: Vec::new(),
             groups: Vec::new(),
             visible: Vec::new(),
@@ -462,11 +466,23 @@ impl App {
 
     /// Re-scan the worktree's session logs, rebuild the merged event list, and
     /// re-pin the cursor to the same change. Cheap to call on a tick — the
-    /// sessionx `Timeline` reparses only files whose size/mtime changed.
+    /// sessionx `Timeline` reparses only files whose size/mtime changed, and
+    /// `CommitIndex` scans only appended log lines and runs git once per commit.
     fn refresh(&mut self) {
         let files = session_files(&self.worktree);
         self.timeline.refresh(&files);
-        let events = self.timeline.events().to_vec();
+        let mut events = self.timeline.events().to_vec();
+        let committed = self.commits.refresh(&self.worktree, &files, &events);
+        if !committed.is_empty() {
+            events.extend(committed);
+            // Same order as sessionx's Timeline. The sort is stable, so a
+            // commit's hunks within one file stay top-to-bottom.
+            events.sort_by(|a, b| {
+                b.timestamp_ms
+                    .cmp(&a.timestamp_ms)
+                    .then_with(|| a.file_path.cmp(&b.file_path))
+            });
+        }
         self.set_events_and_rebuild(events);
     }
 
