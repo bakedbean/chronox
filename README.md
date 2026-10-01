@@ -1,7 +1,8 @@
 # chronox
 
 A standalone [ratatui](https://ratatui.rs) terminal UI for browsing the
-newest-first timeline of file changes a Claude Code agent made in a worktree,
+newest-first timeline of file changes a coding agent (Claude Code, Codex, or pi)
+made in a worktree,
 with a syntax-highlighted diff of the selected change. The timeline updates live
 while a session is running.
 
@@ -37,9 +38,39 @@ chronox                      # current directory
 chronox /path/to/worktree    # an explicit worktree
 ```
 
-The worktree must have Claude Code session logs
-(`~/.claude/projects/<encoded-worktree>/*.jsonl`) — run a Claude Code session in
-it (and make a few edits) first, or you'll see the empty state.
+The worktree must have agent session logs — Claude Code
+(`~/.claude/projects/<encoded-worktree>/*.jsonl`), Codex
+(`~/.codex/sessions/**/rollout-*.jsonl` whose recorded cwd is the worktree —
+only the newest 500 rollouts across all projects are checked), or
+pi (`~/.pi/agent/sessions/<encoded-worktree>/*.jsonl`). Sessions from every
+harness are merged into one timeline. Run a session in it (and make a few edits)
+first, or you'll see the empty state.
+
+### Shell edits and commits
+
+Agents don't always edit through an edit tool: a `sed -i`, a heredoc, or a
+script run from the shell leaves no Edit/Write call in the session log. chronox
+recovers those changes, best-effort, from the commits made during a session.
+A commit counts only if its time falls within a session's span (so a human
+commit made in the worktree mid-session counts too), and is found from:
+
+- `git commit` output (`[branch sha] subject`) in the session log;
+- the worktree's HEAD reflog (which catches `git commit -q`);
+- `git log --oneline` lines in the output of a tool call that ran
+  `git commit` (which catches quiet commits — e.g. behind commit hooks — whose
+  reflog has since been lost, as when a worktree is recreated).
+
+Each hunk of such a commit appears as its own change, summarized as
+`<sha> <subject>`, at the commit's time. A hunk whose lines edit tools already
+wrote since the previous commit is not shown twice (compared ignoring
+whitespace); other hunks in the same file still are. Versions of one commit —
+a rebased copy (same patch or subject) or an amend — collapse into the version
+HEAD reaches, shown at the earliest version's time; commits where one is an
+ancestor of the other (e.g. a revert and a reapply) are never collapsed.
+
+Not recovered: shell edits that were never committed, changes inside merge
+commits, binary files, mode-only changes, and empty files. A rename appears as
+a deletion plus a new file.
 
 ## Keys
 
