@@ -467,7 +467,8 @@ impl App {
     /// Re-scan the worktree's session logs, rebuild the merged event list, and
     /// re-pin the cursor to the same change. Cheap to call on a tick — the
     /// sessionx `Timeline` reparses only files whose size/mtime changed, and
-    /// `CommitIndex` scans only appended log lines and runs git once per commit.
+    /// `CommitIndex` scans only appended log lines and reuses its result until
+    /// one grows (then re-reads the reflog and resolves only new commits).
     fn refresh(&mut self) {
         let files = session_files(&self.worktree);
         self.timeline.refresh(&files);
