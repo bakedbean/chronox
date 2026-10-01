@@ -116,9 +116,17 @@ pub struct CommitIndex {
     reachable: HashMap<String, (String, bool)>,
     /// (a, b) -> a is an ancestor of b. Immutable, so cached for good.
     ancestry: HashMap<(String, String), bool>,
-    /// The events returned by the last refresh and the tool-event count they
-    /// were built against, reused until a log grows.
-    last: Option<(usize, Vec<ChangeEvent>)>,
+    /// The events returned by the last refresh and what they were built
+    /// against, reused while that is unchanged and no log grew.
+    last: Option<(CacheKey, Vec<ChangeEvent>)>,
+}
+
+/// Inputs besides log contents that the result depends on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CacheKey {
+    sessions: Vec<PathBuf>,
+    head: String,
+    tool_events: usize,
 }
 
 /// The lines an edit tool removed and wrote, normalized by `norm`.
@@ -155,18 +163,26 @@ impl CommitIndex {
             grew |= scan.offset != before;
         }
 
-        if !grew
-            && let Some((n, last)) = &self.last
-            && *n == tool_events.len()
-        {
-            return last.clone();
-        }
         if self.toplevel.is_none() {
             self.toplevel = git_toplevel(worktree);
         }
         let Some(toplevel) = self.toplevel.clone() else {
             return Vec::new();
         };
+        // HEAD decides which version of a rewritten commit is kept.
+        let head = git(&toplevel, &["rev-parse", "HEAD"]).unwrap_or_default();
+        let head = head.trim().to_string();
+        let key = CacheKey {
+            sessions: sessions.to_vec(),
+            head: head.clone(),
+            tool_events: tool_events.len(),
+        };
+        if !grew
+            && let Some((k, last)) = &self.last
+            && *k == key
+        {
+            return last.clone();
+        }
         self.reflog = Some(reflog_commits(&toplevel));
 
         let spans: Vec<(i64, i64)> = sessions
@@ -217,8 +233,7 @@ impl CommitIndex {
             .iter()
             .filter_map(|m| self.loaded.get(&m.full))
             .collect();
-        let head = git(&toplevel, &["rev-parse", "HEAD"]).unwrap_or_default();
-        let head = head.trim();
+        let head = head.as_str();
         for c in &commits {
             let stale = self.reachable.get(&c.full).is_none_or(|(h, _)| h != head);
             if stale {
@@ -271,7 +286,7 @@ impl CommitIndex {
                 });
         }
         let events = build_events(&toplevel, worktree, kept, tool_events, &self.tool_lines);
-        self.last = Some((tool_events.len(), events.clone()));
+        self.last = Some((key, events.clone()));
         events
     }
 }
@@ -354,14 +369,14 @@ fn source_key(src: &ChangeSource) -> (PathBuf, usize, usize) {
     (src.session_file.clone(), src.line_index, src.index_in_line)
 }
 
-/// Compare lines ignoring whitespace, so a formatter run by a commit hook
-/// doesn't hide that a tool already made the change.
+/// Lines compare exactly except for trailing whitespace: leading whitespace
+/// and spacing inside a line can be meaningful (indentation, string literals).
 fn norm(line: &str) -> String {
-    line.split_whitespace().collect()
+    line.trim_end().to_string()
 }
 
 fn tool_lines(detail: &ChangeDetail) -> ToolLines {
-    let set = |s: &str| s.lines().map(norm).filter(|l| !l.is_empty()).collect();
+    let set = |s: &str| s.lines().map(norm).collect();
     match detail {
         ChangeDetail::Edit { old, new } => ToolLines {
             old: set(old),
@@ -375,19 +390,39 @@ fn tool_lines(detail: &ChangeDetail) -> ToolLines {
     }
 }
 
-/// The non-blank lines a hunk removed and added (context excluded),
-/// normalized by `norm`.
+/// The lines a hunk removed and added: everything outside the longest common
+/// subsequence of its old and new sides. Ordered, so moving lines around
+/// counts as removing and re-adding them.
 fn changed_lines(old: &str, new: &str) -> (Vec<String>, Vec<String>) {
-    let mut removed: Vec<String> = old.lines().map(norm).filter(|l| !l.is_empty()).collect();
-    let mut added: Vec<String> = Vec::new();
-    for l in new.lines().map(norm).filter(|l| !l.is_empty()) {
-        match removed.iter().position(|r| *r == l) {
-            Some(i) => {
-                removed.swap_remove(i); // unchanged context
-            }
-            None => added.push(l),
+    let a: Vec<String> = old.lines().map(norm).collect();
+    let b: Vec<String> = new.lines().map(norm).collect();
+    // lcs[i][j] = LCS length of a[i..] and b[j..].
+    let mut lcs = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            lcs[i][j] = if a[i] == b[j] {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
         }
     }
+    let (mut removed, mut added) = (Vec::new(), Vec::new());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i] == b[j] {
+            i += 1;
+            j += 1;
+        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+            removed.push(a[i].clone());
+            i += 1;
+        } else {
+            added.push(b[j].clone());
+            j += 1;
+        }
+    }
+    removed.extend(a[i..].iter().cloned());
+    added.extend(b[j..].iter().cloned());
     (removed, added)
 }
 
@@ -435,9 +470,13 @@ fn build_events(
                     return false;
                 }
                 let (removed, added) = changed_lines(old, new);
-                removed
-                    .iter()
-                    .all(|l| window.iter().any(|w| w.old.contains(l)))
+                // Blank lines appear in nearly every edit, so they can't show
+                // that a tool made this change: require a non-blank one.
+                let substantive = removed.iter().chain(&added).any(|l| !l.is_empty());
+                substantive
+                    && removed
+                        .iter()
+                        .all(|l| window.iter().any(|w| w.old.contains(l)))
                     && added
                         .iter()
                         .all(|l| window.iter().any(|w| w.new.contains(l)))
@@ -1125,8 +1164,7 @@ Binary files a/img.png and b/img.png differ
         let (_dir, repo, log) = fixture();
         let mut idx = CommitIndex::default();
         let commit_ts = idx.refresh(&repo, &[PathBuf::from(&log)], &[])[0].timestamp_ms;
-        // Same second as the commit but after its truncated timestamp, and
-        // reformatted (as a commit hook might).
+        // Same second as the commit but after its truncated timestamp.
         let tool_edit = ChangeEvent {
             timestamp_ms: commit_ts + 400,
             tool: ChangeTool::Edit,
@@ -1134,7 +1172,7 @@ Binary files a/img.png and b/img.png differ
             summary: String::new(),
             detail: ChangeDetail::Edit {
                 old: "two".into(),
-                new: "  TWO  ".into(),
+                new: "TWO  ".into(), // trailing whitespace is ignored
             },
             source: ChangeSource::default(),
         };
@@ -1187,6 +1225,63 @@ Binary files a/img.png and b/img.png differ
                 new: "line 10\nsed edit\nline 12".into(),
             }]
         );
+    }
+
+    /// An Edit to `a.txt` (`one` -> `uno`) unrelated to a later shell change.
+    fn unrelated_tool_edit(repo: &Path) -> ChangeEvent {
+        let commit_s: i64 = run_git(repo, &["show", "-s", "--format=%ct"])
+            .trim()
+            .parse()
+            .unwrap();
+        ChangeEvent {
+            timestamp_ms: commit_s * 1000 + 300,
+            tool: ChangeTool::Edit,
+            file_path: repo.join("a.txt"),
+            summary: String::new(),
+            detail: ChangeDetail::Edit {
+                old: "one".into(),
+                new: "uno".into(),
+            },
+            source: ChangeSource::default(),
+        }
+    }
+
+    #[test]
+    fn refresh_keeps_a_shell_reorder_beside_an_unrelated_tool_edit() {
+        let (_dir, repo, _) = fixture();
+        std::fs::write(repo.join("a.txt"), "three\nTWO\none\n").unwrap();
+        run_git(&repo, &["commit", "-q", "-am", "reorder"]);
+        let tool = unrelated_tool_edit(&repo);
+        let evs = CommitIndex::default().refresh(&repo, &[quiet_log(&repo)], &[tool]);
+        assert!(summaries(&evs).contains(&"reorder".to_string()), "{evs:#?}");
+    }
+
+    #[test]
+    fn refresh_keeps_whitespace_and_blank_line_shell_edits() {
+        let (_dir, repo, _) = fixture();
+        std::fs::write(repo.join("a.txt"), "one\n    TWO\n\nthree\n").unwrap();
+        run_git(&repo, &["commit", "-q", "-am", "indent"]);
+        let tool = unrelated_tool_edit(&repo);
+        let evs = CommitIndex::default().refresh(&repo, &[quiet_log(&repo)], &[tool]);
+        assert!(summaries(&evs).contains(&"indent".to_string()), "{evs:#?}");
+    }
+
+    #[test]
+    fn refresh_recomputes_when_a_session_goes_away_or_head_moves() {
+        let (_dir, repo, log) = fixture();
+        let log = PathBuf::from(&log);
+        let mut idx = CommitIndex::default();
+        assert!(
+            !idx.refresh(&repo, std::slice::from_ref(&log), &[])
+                .is_empty()
+        );
+        assert!(idx.refresh(&repo, &[], &[]).is_empty(), "session removed");
+        idx.refresh(&repo, std::slice::from_ref(&log), &[]);
+        let head_before = idx.last.as_ref().unwrap().0.head.clone();
+        run_git(&repo, &["checkout", "-q", "--detach", "HEAD~1"]);
+        idx.refresh(&repo, std::slice::from_ref(&log), &[]);
+        let head_after = idx.last.as_ref().unwrap().0.head.clone();
+        assert_ne!(head_before, head_after, "recomputed against the new HEAD");
     }
 
     #[test]
