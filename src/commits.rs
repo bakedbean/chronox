@@ -527,16 +527,57 @@ fn resolve_commit(dir: &Path, sha: &str) -> Option<Commit> {
     })
 }
 
-/// Strip git's `a/`/`b/` prefix and any C-style quoting from a patch path.
+/// Decode a `---`/`+++` path as git writes it, then strip its `a/`/`b/`
+/// prefix. Git C-quotes a path containing `"`, `\` or control characters
+/// (`"b/a\tb.txt"`, octal `\ooo` for raw bytes); an unquoted path containing a
+/// space is followed by a tab delimiter, which isn't part of the name.
 fn patch_path(raw: &str, prefix: &str) -> String {
-    let unquoted = raw
-        .strip_prefix('"')
-        .and_then(|s| s.strip_suffix('"'))
-        .unwrap_or(raw);
-    unquoted
-        .strip_prefix(prefix)
-        .unwrap_or(unquoted)
-        .to_string()
+    let decoded = match raw.strip_prefix('"') {
+        Some(quoted) => unquote_c(quoted),
+        None => raw.strip_suffix('\t').unwrap_or(raw).to_string(),
+    };
+    match decoded.strip_prefix(prefix) {
+        Some(rest) => rest.to_string(),
+        None => decoded,
+    }
+}
+
+/// Decode the body of a C-quoted git path (after the opening `"`), stopping at
+/// the closing quote.
+fn unquote_c(quoted: &str) -> String {
+    let mut bytes = Vec::new();
+    let mut it = quoted.bytes().peekable();
+    while let Some(b) = it.next() {
+        match b {
+            b'"' => break,
+            b'\\' => match it.next() {
+                Some(b'a') => bytes.push(0x07),
+                Some(b'b') => bytes.push(0x08),
+                Some(b't') => bytes.push(b'\t'),
+                Some(b'n') => bytes.push(b'\n'),
+                Some(b'v') => bytes.push(0x0b),
+                Some(b'f') => bytes.push(0x0c),
+                Some(b'r') => bytes.push(b'\r'),
+                Some(d @ b'0'..=b'7') => {
+                    let mut v = u32::from(d - b'0');
+                    for _ in 0..2 {
+                        match it.peek() {
+                            Some(&n @ b'0'..=b'7') => {
+                                v = v * 8 + u32::from(n - b'0');
+                                it.next();
+                            }
+                            _ => break,
+                        }
+                    }
+                    bytes.push(v as u8);
+                }
+                Some(other) => bytes.push(other), // \" and \\
+                None => break,
+            },
+            _ => bytes.push(b),
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// Parse a unified `git diff` patch into per-file changes. Binary files are
@@ -746,6 +787,37 @@ Binary files a/img.png and b/img.png differ
                 },
             ]
         );
+    }
+
+    #[test]
+    fn patch_path_decodes_git_path_formats() {
+        assert_eq!(patch_path("b/src/a.rs", "b/"), "src/a.rs");
+        // Unquoted path with a space: git appends a tab delimiter.
+        assert_eq!(patch_path("b/a file.txt\t", "b/"), "a file.txt");
+        // Quoted path: escapes decoded, prefix inside the quotes.
+        assert_eq!(patch_path("\"b/a\\tb.txt\"", "b/"), "a\tb.txt");
+        assert_eq!(patch_path("\"a/q\\\"x\\\\y\"", "a/"), "q\"x\\y");
+        // Octal bytes form UTF-8 (core.quotepath=true style).
+        assert_eq!(patch_path("\"b/caf\\303\\251\"", "b/"), "café");
+    }
+
+    #[test]
+    fn refresh_resolves_paths_with_spaces_and_tabs() {
+        let (_dir, repo, _) = fixture();
+        std::fs::write(repo.join("a file.txt"), "x\n").unwrap();
+        std::fs::write(repo.join("t\tb.txt"), "y\n").unwrap();
+        run_git(&repo, &["add", "."]);
+        let out = run_git(&repo, &["commit", "-m", "odd names"]);
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let log = repo.join("odd.jsonl");
+        let line = serde_json::json!({"timestamp": now, "o": out});
+        std::fs::write(&log, format!("{line}\n")).unwrap();
+        let evs = CommitIndex::default().refresh(&repo, &[log], &[]);
+        let mut paths: Vec<_> = evs.iter().map(|e| e.file_path.clone()).collect();
+        paths.sort();
+        paths.dedup();
+        assert!(paths.contains(&repo.join("a file.txt")), "{paths:?}");
+        assert!(paths.contains(&repo.join("t\tb.txt")), "{paths:?}");
     }
 
     // ── against a real repository ─────────────────────────────────────────
