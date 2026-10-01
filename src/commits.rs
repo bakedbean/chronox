@@ -5,7 +5,10 @@
 //! turn every hunk into a `ChangeEvent` shaped like an Edit (old = context +
 //! removed, new = context + added).
 //!
-//! Commits are found two ways, so either alone is enough:
+//! Every commit must also have been made within a session's time span: a sha
+//! in a log only proves the commit exists (a user may paste an old one), not
+//! that the session made it. Commits are found three ways, so any one is
+//! enough:
 //! - `[branch sha] subject` output of a `git commit` in a session log;
 //! - the worktree's HEAD reflog entries (`commit:`, `commit (amend):`, …) whose
 //!   commit time falls within a session's span — this catches `git commit -q`,
@@ -49,6 +52,16 @@ struct FileDiff {
     change: FileChange,
 }
 
+/// A commit's metadata — cheap to fetch, enough to reject it before loading
+/// its patch.
+#[derive(Debug, Clone)]
+struct CommitMeta {
+    full: String,
+    parent: String,
+    ts_ms: i64,
+    subject: String,
+}
+
 #[derive(Debug, Clone)]
 struct Commit {
     full: String,
@@ -81,18 +94,34 @@ struct LogScan {
 
 /// Commit-derived events for a worktree, cached across refreshes. Session logs
 /// are append-only, so each log is scanned incrementally from where the last
-/// scan stopped; commits are immutable, so each sha is resolved through git
-/// once; the reflog is re-read only when a log grew.
+/// scan stopped, and nothing is recomputed until one grows. Commits are
+/// immutable, so each sha's metadata is fetched once, and a patch only for
+/// commits made within a session.
 #[derive(Debug, Default)]
 pub struct CommitIndex {
     scanned: HashMap<PathBuf, LogScan>,
-    /// HEAD reflog commits as `(sha, commit time ms)`; `None` until first read.
-    reflog: Option<Vec<(String, i64)>>,
-    /// Sha (abbreviated or full) -> resolved commit; `None` when it isn't a
-    /// non-merge commit in this repository.
-    resolved: HashMap<String, Option<Commit>>,
-    /// `git rev-parse --show-toplevel`, resolved on first use.
-    toplevel: Option<Option<PathBuf>>,
+    /// HEAD reflog `git commit` entries; `None` until first read.
+    reflog: Option<Vec<ReflogCommit>>,
+    /// Sha (abbreviated or full) -> metadata; `None` when it isn't a non-merge
+    /// commit in this repository.
+    meta: HashMap<String, Option<CommitMeta>>,
+    /// Full sha -> commit with its patch.
+    loaded: HashMap<String, Commit>,
+    /// `git rev-parse --show-toplevel`, once it succeeds.
+    toplevel: Option<PathBuf>,
+    /// Full sha -> (HEAD it was checked against, reachable from that HEAD).
+    reachable: HashMap<String, (String, bool)>,
+    /// The events returned by the last refresh and the tool-event count they
+    /// were built against, reused until a log grows.
+    last: Option<(usize, Vec<ChangeEvent>)>,
+}
+
+#[derive(Debug, Clone)]
+struct ReflogCommit {
+    sha: String,
+    ts_ms: i64,
+    /// Made by `git commit --amend`, replacing a same-parent sibling.
+    amend: bool,
 }
 
 impl CommitIndex {
@@ -114,64 +143,97 @@ impl CommitIndex {
             grew |= scan.offset != before;
         }
 
-        let toplevel = self
-            .toplevel
-            .get_or_insert_with(|| git_toplevel(worktree))
-            .clone();
-        let Some(toplevel) = toplevel else {
+        if !grew
+            && let Some((n, last)) = &self.last
+            && *n == tool_events.len()
+        {
+            return last.clone();
+        }
+        if self.toplevel.is_none() {
+            self.toplevel = git_toplevel(worktree);
+        }
+        let Some(toplevel) = self.toplevel.clone() else {
             return Vec::new();
         };
-        if grew || self.reflog.is_none() {
-            self.reflog = Some(reflog_commits(&toplevel));
-        }
+        self.reflog = Some(reflog_commits(&toplevel));
 
-        let spans: Vec<(i64, i64)> = self.scanned.values().filter_map(|s| s.span).collect();
+        let spans: Vec<(i64, i64)> = sessions
+            .iter()
+            .filter_map(|p| self.scanned.get(p)?.span)
+            .collect();
         let in_session = |ts: i64| {
             spans
                 .iter()
                 .any(|(lo, hi)| ts >= lo - SPAN_SLACK_MS && ts <= hi + SPAN_SLACK_MS)
         };
-        // (sha, must the commit time fall within a session?)
-        let candidates: Vec<(String, bool)> = self
-            .scanned
-            .values()
-            .flat_map(|s| {
-                let strong = s.shas.iter().map(|sha| (sha.clone(), false));
-                strong.chain(s.oneline_shas.iter().map(|sha| (sha.clone(), true)))
-            })
+        // In evidence order: each log's shas in the order they appeared, then
+        // the reflog (whose times are known, so out-of-span entries drop here).
+        let candidates: Vec<String> = sessions
+            .iter()
+            .filter_map(|p| self.scanned.get(p))
+            .flat_map(|s| s.shas.iter().chain(&s.oneline_shas).cloned())
             .chain(
                 self.reflog
                     .iter()
                     .flatten()
-                    .filter(|(_, ts)| in_session(*ts))
-                    .map(|(sha, _)| (sha.clone(), false)),
+                    .filter(|r| in_session(r.ts_ms))
+                    .map(|r| r.sha.clone()),
             )
             .collect();
 
-        let mut commits: Vec<&Commit> = Vec::new();
-        let mut seen = HashSet::new();
-        for (sha, _) in &candidates {
-            if !self.resolved.contains_key(sha) {
-                let commit = resolve_commit(&toplevel, sha);
-                self.resolved.insert(sha.clone(), commit);
-            }
-        }
-        for (sha, needs_span) in &candidates {
-            if let Some(Some(c)) = self.resolved.get(sha)
-                && (!needs_span || in_session(c.ts_ms))
-                && seen.insert(c.full.as_str())
+        let mut accepted: Vec<CommitMeta> = Vec::new();
+        for sha in &candidates {
+            let meta = self
+                .meta
+                .entry(sha.clone())
+                .or_insert_with(|| commit_meta(&toplevel, sha));
+            if let Some(m) = meta
+                && in_session(m.ts_ms)
+                && !accepted.iter().any(|a| a.full == m.full)
             {
-                commits.push(c);
+                accepted.push(m.clone());
             }
         }
-        build_events(&toplevel, worktree, drop_amended(commits), tool_events)
+        for m in &accepted {
+            if !self.loaded.contains_key(&m.full)
+                && let Some(c) = load_commit(&toplevel, m.clone())
+            {
+                self.loaded.insert(m.full.clone(), c);
+            }
+        }
+        let commits: Vec<&Commit> = accepted
+            .iter()
+            .filter_map(|m| self.loaded.get(&m.full))
+            .collect();
+        let head = git(&toplevel, &["rev-parse", "HEAD"]).unwrap_or_default();
+        let head = head.trim();
+        for c in &commits {
+            let stale = self.reachable.get(&c.full).is_none_or(|(h, _)| h != head);
+            if stale {
+                let r = !head.is_empty()
+                    && git(&toplevel, &["merge-base", "--is-ancestor", &c.full, head]).is_some();
+                self.reachable.insert(c.full.clone(), (head.to_string(), r));
+            }
+        }
+        let amends: HashSet<&str> = self
+            .reflog
+            .iter()
+            .flatten()
+            .filter(|r| r.amend)
+            .map(|r| r.sha.as_str())
+            .collect();
+        let reachable = |c: &Commit| self.reachable.get(&c.full).is_some_and(|(_, r)| *r);
+        let kept = drop_superseded(commits, &reachable, &amends);
+        let events = build_events(&toplevel, worktree, kept, tool_events);
+        self.last = Some((tool_events.len(), events.clone()));
+        events
     }
 }
 
 /// Commits recorded in the worktree's HEAD reflog by `git commit` (including
-/// amend/initial), as `(sha, commit time ms)`. Rebases, resets and checkouts
-/// are excluded: they move HEAD without the agent writing new changes.
-fn reflog_commits(dir: &Path) -> Vec<(String, i64)> {
+/// amend/initial). Rebases, resets and checkouts are excluded: they move HEAD
+/// without the agent writing new changes.
+fn reflog_commits(dir: &Path) -> Vec<ReflogCommit> {
     let Some(out) = git(dir, &["log", "-g", "--format=%H%x00%ct%x00%gs", "HEAD"]) else {
         return Vec::new();
     };
@@ -182,7 +244,11 @@ fn reflog_commits(dir: &Path) -> Vec<(String, i64)> {
             if !gs.starts_with("commit") {
                 return None;
             }
-            Some((sha.to_string(), ts.parse::<i64>().ok()? * 1000))
+            Some(ReflogCommit {
+                sha: sha.to_string(),
+                ts_ms: ts.parse::<i64>().ok()? * 1000,
+                amend: gs.starts_with("commit (amend)"),
+            })
         })
         .collect()
 }
@@ -197,25 +263,44 @@ fn patch_id(patch: &str) -> u64 {
     h.finish()
 }
 
-/// Collapse commits that are versions of the same change, oldest-first:
-/// - a rebased copy has the same patch as its original; keep the original,
-///   whose time is when the edit was actually made;
-/// - `git commit --amend` (or a reset and recommit) makes a sibling with the
-///   same parent; keep the newest, which replaced the earlier one.
-fn drop_amended(mut commits: Vec<&Commit>) -> Vec<&Commit> {
-    commits.sort_by_key(|c| c.ts_ms);
-    let mut patches = HashSet::new();
-    commits.retain(|c| patches.insert(c.patch_id));
-    let mut newest: HashMap<&str, usize> = HashMap::new();
-    for (i, c) in commits.iter().enumerate() {
-        newest.insert(c.parent.as_str(), i);
+/// Drop commits that history has replaced, returning the rest with the time to
+/// show them at, oldest-first. A commit is replaced only when HEAD no longer
+/// reaches it *and* a reachable commit took its place:
+/// - a rebased copy (same patch) — shown at the original's time, when the edit
+///   was actually made;
+/// - an amended version (same parent, and same subject or an amend per the
+///   reflog).
+///
+/// Reachable commits are never dropped, so a change reapplied after a revert,
+/// or two branches from one base, all stay.
+fn drop_superseded<'a>(
+    commits: Vec<&'a Commit>,
+    reachable: &dyn Fn(&Commit) -> bool,
+    amends: &HashSet<&str>,
+) -> Vec<(&'a Commit, i64)> {
+    let live: Vec<&Commit> = commits.iter().copied().filter(|c| reachable(c)).collect();
+    let mut shown: HashMap<&str, i64> = live.iter().map(|c| (c.full.as_str(), c.ts_ms)).collect();
+    let mut kept: Vec<&Commit> = live.clone();
+    for c in commits.iter().copied().filter(|c| !reachable(c)) {
+        if let Some(copy) = live.iter().find(|l| l.patch_id == c.patch_id) {
+            let t = shown.get_mut(copy.full.as_str()).expect("live commit");
+            *t = (*t).min(c.ts_ms);
+            continue;
+        }
+        let amended = live.iter().any(|l| {
+            l.parent == c.parent && (l.subject == c.subject || amends.contains(l.full.as_str()))
+        });
+        if !amended {
+            kept.push(c);
+            shown.insert(c.full.as_str(), c.ts_ms);
+        }
     }
-    commits
-        .iter()
-        .enumerate()
-        .filter(|(i, c)| newest.get(c.parent.as_str()) == Some(i))
-        .map(|(_, c)| *c)
-        .collect()
+    let mut out: Vec<(&Commit, i64)> = kept
+        .into_iter()
+        .map(|c| (c, shown[c.full.as_str()]))
+        .collect();
+    out.sort_by_key(|(_, t)| *t);
+    out
 }
 
 /// Turn `commits` (oldest-first) into events, skipping a commit's file when an
@@ -223,7 +308,7 @@ fn drop_amended(mut commits: Vec<&Commit>) -> Vec<&Commit> {
 fn build_events(
     toplevel: &Path,
     worktree: &Path,
-    commits: Vec<&Commit>,
+    commits: Vec<(&Commit, i64)>,
     tool_events: &[ChangeEvent],
 ) -> Vec<ChangeEvent> {
     let tool_paths: Vec<(PathBuf, i64)> = tool_events
@@ -232,7 +317,7 @@ fn build_events(
         .collect();
     let mut out = Vec::new();
     let mut prev_ts = i64::MIN;
-    for c in commits {
+    for (c, ts_ms) in commits {
         let short = &c.full[..c.full.len().min(7)];
         let summary = clip(&format!("{short} {}", c.subject), SUMMARY_MAX);
         let source_file = PathBuf::from(format!("git:{}", c.full));
@@ -240,12 +325,12 @@ fn build_events(
             let path = toplevel.join(&f.path);
             let covered = tool_paths
                 .iter()
-                .any(|(p, ts)| *p == path && *ts > prev_ts && *ts <= c.ts_ms);
+                .any(|(p, ts)| *p == path && *ts > prev_ts && *ts <= ts_ms);
             if covered {
                 continue;
             }
             let mk = |hi: usize, tool: ChangeTool, detail: ChangeDetail| ChangeEvent {
-                timestamp_ms: c.ts_ms,
+                timestamp_ms: ts_ms,
                 tool,
                 file_path: path.clone(),
                 summary: summary.clone(),
@@ -286,7 +371,7 @@ fn build_events(
                 }
             }
         }
-        prev_ts = c.ts_ms;
+        prev_ts = ts_ms;
     }
     out
 }
@@ -448,8 +533,9 @@ fn is_sha(s: &str) -> bool {
 }
 
 /// Shas from `git commit` output lines: `[<branch> <sha>] <subject>`, also
-/// `[<branch> (root-commit) <sha>]` and `[detached HEAD <sha>]`. Candidates are
-/// confirmed against the repository before use, so a stray match is harmless.
+/// `[<branch> (root-commit) <sha>]` and `[detached HEAD <sha>]`. A match may be
+/// quoted text rather than real output, so candidates must also exist in the
+/// repository and fall within a session's time span.
 fn commit_shas_in(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in text.lines() {
@@ -488,9 +574,9 @@ fn git_toplevel(worktree: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(top.trim_end()))
 }
 
-/// Resolve `sha` to a commit in the repo at `dir`, with its patch. `None` for
-/// unknown shas (e.g. a commit made in another repository) and merge commits.
-fn resolve_commit(dir: &Path, sha: &str) -> Option<Commit> {
+/// Metadata for `sha` in the repo at `dir`. `None` for unknown shas (e.g. a
+/// commit made in another repository) and merge commits.
+fn commit_meta(dir: &Path, sha: &str) -> Option<CommitMeta> {
     let rev = format!("{sha}^{{commit}}");
     let meta = git(dir, &["show", "-s", "--format=%H%x00%P%x00%ct%x00%s", &rev])?;
     let mut parts = meta.trim_end_matches('\n').splitn(4, '\0');
@@ -501,6 +587,16 @@ fn resolve_commit(dir: &Path, sha: &str) -> Option<Commit> {
     if parents.split_whitespace().count() > 1 {
         return None;
     }
+    Some(CommitMeta {
+        full,
+        parent: parents.trim().to_string(),
+        ts_ms: ts * 1000,
+        subject,
+    })
+}
+
+/// Load the patch for a commit whose metadata is known.
+fn load_commit(dir: &Path, m: CommitMeta) -> Option<Commit> {
     let patch = git(
         dir,
         &[
@@ -514,14 +610,14 @@ fn resolve_commit(dir: &Path, sha: &str) -> Option<Commit> {
             // One context line: enough to anchor the hunk in the file, and close to
             // an Edit call's old/new shape (sessionx counts context as changed).
             "-U1",
-            &full,
+            &m.full,
         ],
     )?;
     Some(Commit {
-        full,
-        parent: parents.trim().to_string(),
-        ts_ms: ts * 1000,
-        subject,
+        full: m.full,
+        parent: m.parent,
+        ts_ms: m.ts_ms,
+        subject: m.subject,
         files: parse_patch(&patch),
         patch_id: patch_id(&patch),
     })
@@ -823,7 +919,16 @@ Binary files a/img.png and b/img.png differ
     // ── against a real repository ─────────────────────────────────────────
 
     fn run_git(dir: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
+        run_git_at(dir, None, args)
+    }
+
+    /// `run_git`, optionally committing at `date` (author and committer).
+    fn run_git_at(dir: &Path, date: Option<&str>, args: &[&str]) -> String {
+        let mut cmd = Command::new("git");
+        if let Some(d) = date {
+            cmd.env("GIT_AUTHOR_DATE", d).env("GIT_COMMITTER_DATE", d);
+        }
+        let out = cmd
             .arg("-C")
             .arg(dir)
             .args([
@@ -849,14 +954,21 @@ Binary files a/img.png and b/img.png differ
         run_git(&repo, &["init", "-q"]);
         std::fs::write(repo.join("a.txt"), "one\ntwo\nthree\n").unwrap();
         run_git(&repo, &["add", "."]);
-        run_git(&repo, &["commit", "-q", "-m", "base"]);
+        // Made long before the session, so only the second commit is its work.
+        run_git_at(
+            &repo,
+            Some("2001-01-01T00:00:00Z"),
+            &["commit", "-q", "-m", "base"],
+        );
         std::fs::write(repo.join("a.txt"), "one\nTWO\nthree\n").unwrap();
         std::fs::write(repo.join("b.txt"), "new\n").unwrap();
         run_git(&repo, &["add", "."]);
         let out = run_git(&repo, &["commit", "-m", "shell edits"]);
         let log = repo.join("session.jsonl");
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let line = serde_json::json!({
             "type": "user",
+            "timestamp": now,
             "message": {"content": [{"type": "tool_result", "content": out}]},
         });
         let mut f = std::fs::File::create(&log).unwrap();
@@ -998,6 +1110,108 @@ Binary files a/img.png and b/img.png differ
             .filter(|e| e.file_path == repo.join("a.txt"))
             .count();
         assert_eq!(a_edits, 1, "{evs:#?}");
+    }
+
+    #[test]
+    fn refresh_ignores_quoted_commit_output_from_outside_every_session() {
+        let (_dir, repo, _) = fixture();
+        let sha = run_git(&repo, &["rev-parse", "--short", "HEAD"]);
+        // A user pastes old commit output into a session that started later.
+        let line = serde_json::json!({
+            "timestamp": "2099-01-01T00:00:00.000Z",
+            "message": {"content": format!("[main {}] look at this", sha.trim())},
+        });
+        let log = repo.join("paste.jsonl");
+        std::fs::write(&log, format!("{line}\n")).unwrap();
+        assert!(
+            CommitIndex::default()
+                .refresh(&repo, &[log], &[])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn refresh_reuses_its_result_until_a_log_grows() {
+        let (_dir, repo, log) = fixture();
+        let mut idx = CommitIndex::default();
+        let log = PathBuf::from(&log);
+        let first = idx.refresh(&repo, std::slice::from_ref(&log), &[]);
+        assert!(!first.is_empty());
+        // Losing the repo's objects can't change an unchanged log's result.
+        std::fs::remove_dir_all(repo.join(".git")).unwrap();
+        assert_eq!(idx.refresh(&repo, std::slice::from_ref(&log), &[]), first);
+    }
+
+    /// A session log spanning "now" with no commit output: commits are found
+    /// through the reflog.
+    fn quiet_log(repo: &Path) -> PathBuf {
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let log = repo.join("quiet.jsonl");
+        std::fs::write(&log, format!("{{\"timestamp\":\"{now}\"}}\n")).unwrap();
+        log
+    }
+
+    fn summaries(evs: &[ChangeEvent]) -> Vec<String> {
+        let mut out: Vec<String> = evs
+            .iter()
+            .map(|e| e.summary.split_once(' ').unwrap().1.to_string())
+            .collect();
+        out.dedup();
+        out
+    }
+
+    #[test]
+    fn refresh_keeps_only_the_amended_version_within_one_second() {
+        let (_dir, repo, _) = fixture();
+        std::fs::write(repo.join("a.txt"), "draft\n").unwrap();
+        run_git(&repo, &["commit", "-q", "-am", "draft"]);
+        std::fs::write(repo.join("a.txt"), "final\n").unwrap();
+        run_git(&repo, &["commit", "-q", "--amend", "-am", "final"]);
+        let evs = CommitIndex::default().refresh(&repo, &[quiet_log(&repo)], &[]);
+        let s = summaries(&evs);
+        assert!(s.contains(&"final".to_string()), "{s:?}");
+        assert!(!s.contains(&"draft".to_string()), "{s:?}");
+    }
+
+    #[test]
+    fn refresh_keeps_sibling_commits_on_two_branches() {
+        let (_dir, repo, _) = fixture();
+        run_git(&repo, &["checkout", "-q", "-b", "left"]);
+        std::fs::write(repo.join("l.txt"), "l\n").unwrap();
+        run_git(&repo, &["add", "l.txt"]);
+        run_git(&repo, &["commit", "-q", "-m", "left work"]);
+        run_git(&repo, &["checkout", "-q", "-b", "right", "HEAD~1"]);
+        std::fs::write(repo.join("r.txt"), "r\n").unwrap();
+        run_git(&repo, &["add", "r.txt"]);
+        run_git(&repo, &["commit", "-q", "-m", "right work"]);
+        let evs = CommitIndex::default().refresh(&repo, &[quiet_log(&repo)], &[]);
+        let s = summaries(&evs);
+        assert!(s.contains(&"left work".to_string()), "{s:?}");
+        assert!(s.contains(&"right work".to_string()), "{s:?}");
+    }
+
+    #[test]
+    fn refresh_keeps_a_change_reapplied_after_its_revert() {
+        let (_dir, repo, _) = fixture();
+        let head = run_git(&repo, &["rev-parse", "HEAD"]);
+        run_git(&repo, &["revert", "--no-edit", head.trim()]);
+        run_git(&repo, &["cherry-pick", head.trim()]);
+        // cherry-pick and revert aren't `commit` reflog entries; report them
+        // the way an agent's `git log --oneline` check would.
+        let log = repo.join("s.jsonl");
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let shas = run_git(&repo, &["log", "--format=%h %s", "-3"]);
+        let call = serde_json::json!({"timestamp": now, "message": {"content": [
+            {"type": "tool_use", "id": "c", "input": {"command": "git commit; git log --oneline -3"}}]}});
+        let result = serde_json::json!({"timestamp": now, "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "c", "content": shas}]}});
+        std::fs::write(&log, format!("{call}\n{result}\n")).unwrap();
+        let evs = CommitIndex::default().refresh(&repo, &[log], &[]);
+        let a = evs
+            .iter()
+            .filter(|e| e.file_path == repo.join("a.txt"))
+            .count();
+        assert_eq!(a, 3, "apply, revert, reapply: {:?}", summaries(&evs));
     }
 
     #[test]
